@@ -1,6 +1,6 @@
 # VPS Ops Toolkit (`ops.sh`)
 
-单文件 Linux VPS 运维工具箱（v1.1.0），将常用初始化、清理、网络测速与代理/DDNS 管理整合到一个交互式脚本中，支持交互菜单、子命令直达和 `curl ... | bash` 管道执行。
+单文件 Linux VPS 运维工具箱（v1.2.0），将常用初始化、清理、SSH 安全与审计、网络测速和代理/DDNS 管理整合到一个交互式脚本中，支持交互菜单、子命令直达和 `curl ... | bash` 管道执行。
 
 ## 功能列表
 
@@ -18,7 +18,9 @@
 | 10 | `docker` | 官方脚本安装 Docker、启用服务，并可选一键配置 `/etc/docker/daemon.json` 全局日志轮转 |
 | 11 | `nodequality` | 运行 NodeQuality 综合测试（含连接超时保护） |
 | 12 | `status` | 系统信息与状态速查（OS/内核/BBR/内存/Swap/磁盘/相关服务/可选公网 IP 查询） |
-| 13 | `install-self` | 安装脚本到 `/usr/local/bin/ops`，之后任意目录输入 `ops` 即可使用 |
+| 13 | `install-self` | 安装/更新脚本到 `/usr/local/bin/ops`（别名 `update`），之后任意目录输入 `ops` 即可使用 |
+| 14 | `ssh` | SSH 安全配置（改端口并兼容 Ubuntu `ssh.socket`/防火墙/SELinux、改密码、粘贴或从 GitHub 拉取公钥、防锁死策略开关、`sshd -t` 自动回滚、备份恢复） |
+| 15 | `sshlog` | SSH 日志美化查询（兼容 `journalctl` / `auth.log` / `secure`：统计总览、最近成功/失败对齐表格、异常 IP/用户名 Top 10 柱状图、关键字筛选、实时彩色跟踪） |
 
 ## 快速使用
 
@@ -48,6 +50,8 @@ sudo ./ops.sh
 
 # 或直接调用子命令
 sudo ./ops.sh hostname
+sudo ./ops.sh ssh
+sudo ./ops.sh sshlog
 sudo ./ops.sh swap
 sudo ./ops.sh bbr
 ./ops.sh speedtest   # 临时测速模式无需 root，测完自动删除

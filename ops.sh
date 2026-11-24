@@ -6,7 +6,7 @@
 
 set -u
 
-OPS_VERSION="1.1.0"
+OPS_VERSION="1.2.0"
 OPS_REPO_RAW_URL="https://raw.githubusercontent.com/realLeoKnox/VPS-Ops/main/ops.sh"
 OPS_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
@@ -2343,6 +2343,857 @@ mod_install_self() {
   fi
 }
 
+is_valid_ssh_pubkey() {
+  local key="$1"
+  [[ "$key" =~ ^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/=]{20,}([[:space:]].*)?$ ]]
+}
+
+# 在 sshd drop-in 配置文件中幂等更新或追加指定指令（不破坏其他指令）
+upsert_sshd_option() {
+  local file="$1" key="$2" value="$3"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  if [[ -f "$file" ]]; then
+    awk -v k="$key" -v v="$value" '
+      BEGIN { lk = tolower(k); found = 0 }
+      {
+        line = $0
+        if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) {
+          print line
+          next
+        }
+        split(line, f, /[[:space:]]+/)
+        first = (f[1] == "" ? f[2] : f[1])
+        if (tolower(first) == lk) {
+          if (!found) {
+            print k " " v
+            found = 1
+          }
+          next
+        }
+        print line
+      }
+      END {
+        if (!found) print k " " v
+      }
+    ' "$file" > "$tmp_file"
+  else
+    printf '# Managed by ops.sh\n%s %s\n' "$key" "$value" > "$tmp_file"
+  fi
+  cat "$tmp_file" > "$file"
+  rm -f "$tmp_file"
+}
+
+# 美化解析 SSH 日志流（兼容 journalctl --output=short-iso 与 auth.log / secure）
+# 用法：render_ssh_log_report <summary|accepted|failed|filter> [filter_keyword] [limit]
+render_ssh_log_report() {
+  local mode="${1:-summary}"
+  local filter_kw="${2:-}"
+  local limit="${3:-30}"
+
+  awk \
+    -v mode="$mode" \
+    -v kw="$(printf '%s' "$filter_kw" | tr '[:upper:]' '[:lower:]')" \
+    -v limit="$limit" \
+    -v c_reset="$C_RESET" \
+    -v c_bold="$C_BOLD" \
+    -v c_dim="$C_DIM" \
+    -v c_green="$C_GREEN" \
+    -v c_red="$C_RED" \
+    -v c_yellow="$C_YELLOW" \
+    -v c_cyan="$C_CYAN" '
+    function format_ts(line,    a, t) {
+      # ISO 格式: 2026-11-24T09:40:12+0800 或 2026-11-24T09:40:12.123456+08:00
+      if (match(line, /^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+        t = substr(line, RSTART, RLENGTH)
+        gsub(/T/, " ", t)
+        return t
+      }
+      # 传统 syslog 格式: Nov 24 09:40:12
+      if (match(line, /^[A-Z][a-z]{2}[[:space:]]+[0-9]{1,2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+        t = substr(line, RSTART, RLENGTH)
+        gsub(/[[:space:]]+/, " ", t)
+        return t
+      }
+      return "-"
+    }
+
+    function print_table_header() {
+      # 按等宽终端实际显示宽度对齐（每个中文字符占 2 列）
+      printf "%s时间                 状态        方式         用户名            来源 IP                 端口%s\n", \
+        c_bold, c_reset
+      printf "%s----------------------------------------------------------------------------------------------%s\n", c_dim, c_reset
+    }
+
+    function print_row(ts, st, method, user, ip, port,    badge) {
+      if (st == "OK")        badge = c_green  "[成功]    " c_reset
+      else if (st == "FAIL") badge = c_red    "[失败]    " c_reset
+      else if (st == "INV")  badge = c_yellow "[非法用户]" c_reset
+      else                   badge = c_dim    "[其他]    " c_reset
+      printf "%-19s  %s  %-11s  %-16s  %-22s  %s\n", ts, badge, method, user, ip, port
+    }
+
+    function print_bar(val, maxv,    w, n, i, bar) {
+      w = 20
+      n = (maxv > 0 ? int((val * w + maxv - 1) / maxv) : 0)
+      if (n < 1 && val > 0) n = 1
+      bar = ""
+      for (i = 0; i < n; i++) bar = bar "#"
+      return bar
+    }
+
+    {
+      line = $0
+      st = ""; method = "-"; user = "-"; ip = "-"; port = "-"
+
+      # 1) Accepted <method> for <user> from <ip> port <port>
+      if (line ~ /Accepted [^ ]+ for [^ ]+ from [^ ]+ port [0-9]+/) {
+        st = "OK"
+        sub(/^.*Accepted /, "", line)
+        split(line, f, /[[:space:]]+/)
+        method = f[1]; user = f[3]; ip = f[5]; port = f[7]
+      }
+      # 2) Failed <method> for invalid user <user> from <ip> port <port>
+      else if (line ~ /Failed [^ ]+ for invalid user [^ ]+ from [^ ]+ port [0-9]+/) {
+        st = "INV"
+        sub(/^.*Failed /, "", line)
+        split(line, f, /[[:space:]]+/)
+        method = f[1]; user = f[5]; ip = f[7]; port = f[9]
+      }
+      # 3) Failed <method> for <user> from <ip> port <port>
+      else if (line ~ /Failed [^ ]+ for [^ ]+ from [^ ]+ port [0-9]+/) {
+        st = "FAIL"
+        sub(/^.*Failed /, "", line)
+        split(line, f, /[[:space:]]+/)
+        method = f[1]; user = f[3]; ip = f[5]; port = f[7]
+      }
+      # 4) Invalid user <user> from <ip> [port <port>]
+      else if (line ~ /Invalid user [^ ]+ from [^ ]+/) {
+        st = "INV"
+        sub(/^.*Invalid user /, "", line)
+        split(line, f, /[[:space:]]+/)
+        method = "invalid"; user = f[1]; ip = f[3]
+        if (f[4] == "port" && f[5] != "") port = f[5]
+      }
+      else {
+        next
+      }
+
+      ts = format_ts($0)
+
+      if (mode == "filter") {
+        hay = tolower(ts " " st " " method " " user " " ip " " port)
+        if (kw != "" && index(hay, kw) == 0) next
+      }
+
+      total++
+      ev_ts[total] = ts
+      ev_st[total] = st
+      ev_m[total]  = method
+      ev_u[total]  = user
+      ev_ip[total] = ip
+      ev_p[total]  = port
+
+      if (st == "OK") {
+        ok_cnt++
+        ok_idx[ok_cnt] = total
+      } else {
+        if (st == "FAIL") fail_cnt++
+        if (st == "INV")  inv_cnt++
+        bad_cnt++
+        bad_idx[bad_cnt] = total
+        if (ip != "-") fail_ip[ip]++
+        if (user != "-") fail_user[user]++
+      }
+    }
+
+    END {
+      if (total == 0) {
+        printf "%s未匹配到相关 SSH 登录事件。%s\n", c_yellow, c_reset
+        exit 0
+      }
+
+      if (mode == "accepted") {
+        if (ok_cnt == 0) {
+          printf "%s暂无成功登录记录。%s\n", c_yellow, c_reset
+          exit 0
+        }
+        start = ok_cnt - limit + 1
+        if (start < 1) start = 1
+        print_table_header()
+        for (i = ok_cnt; i >= start; i--) {
+          idx = ok_idx[i]
+          print_row(ev_ts[idx], ev_st[idx], ev_m[idx], ev_u[idx], ev_ip[idx], ev_p[idx])
+        }
+        printf "\n%s共 %d 条成功记录（已显示最近 %d 条）%s\n", c_dim, ok_cnt, ok_cnt - start + 1, c_reset
+        exit 0
+      }
+
+      if (mode == "failed") {
+        if (bad_cnt == 0) {
+          printf "%s暂无失败或非法用户尝试记录。%s\n", c_green, c_reset
+          exit 0
+        }
+        start = bad_cnt - limit + 1
+        if (start < 1) start = 1
+        print_table_header()
+        for (i = bad_cnt; i >= start; i--) {
+          idx = bad_idx[i]
+          print_row(ev_ts[idx], ev_st[idx], ev_m[idx], ev_u[idx], ev_ip[idx], ev_p[idx])
+        }
+        printf "\n%s共 %d 条异常记录（失败 %d / 非法用户 %d，已显示最近 %d 条）%s\n", \
+          c_dim, bad_cnt, fail_cnt + 0, inv_cnt + 0, bad_cnt - start + 1, c_reset
+        exit 0
+      }
+
+      if (mode == "filter") {
+        start = total - limit + 1
+        if (start < 1) start = 1
+        print_table_header()
+        for (i = total; i >= start; i--) {
+          print_row(ev_ts[i], ev_st[i], ev_m[i], ev_u[i], ev_ip[i], ev_p[i])
+        }
+        printf "\n%s共匹配 %d 条记录（已显示最近 %d 条）%s\n", c_dim, total, total - start + 1, c_reset
+        exit 0
+      }
+
+      # summary 模式：统计卡片 + 最近成功登录 + Top 攻击 IP + Top 被爆破用户名
+      uniq_bad_ip = 0
+      for (k in fail_ip) uniq_bad_ip++
+
+      printf "%s[统计总览]%s\n", c_cyan, c_reset
+      printf "  成功登录: %s%d%s   |   认证失败: %s%d%s   |   非法用户: %s%d%s   |   异常来源 IP 数: %s%d%s\n", \
+        c_green, ok_cnt + 0, c_reset, \
+        c_red, fail_cnt + 0, c_reset, \
+        c_yellow, inv_cnt + 0, c_reset, \
+        c_bold, uniq_bad_ip, c_reset
+
+      printf "\n%s[最近成功登录（最多 10 条）]%s\n", c_cyan, c_reset
+      if (ok_cnt == 0) {
+        printf "  %s（无）%s\n", c_dim, c_reset
+      } else {
+        start = ok_cnt - 9
+        if (start < 1) start = 1
+        print_table_header()
+        for (i = ok_cnt; i >= start; i--) {
+          idx = ok_idx[i]
+          print_row(ev_ts[idx], ev_st[idx], ev_m[idx], ev_u[idx], ev_ip[idx], ev_p[idx])
+        }
+      }
+
+      printf "\n%s[异常来源 IP Top 10]%s\n", c_cyan, c_reset
+      if (uniq_bad_ip == 0) {
+        printf "  %s（无异常记录）%s\n", c_green, c_reset
+      } else {
+        max_ip = 0
+        for (k in fail_ip) if (fail_ip[k] > max_ip) max_ip = fail_ip[k]
+        for (rank = 1; rank <= 10; rank++) {
+          best_k = ""; best_v = 0
+          for (k in fail_ip) {
+            if (!(k in used_ip) && fail_ip[k] > best_v) {
+              best_v = fail_ip[k]; best_k = k
+            }
+          }
+          if (best_k == "") break
+          used_ip[best_k] = 1
+          printf "  %2d. %-24s %6d 次  %s%s%s\n", \
+            rank, best_k, best_v, c_red, print_bar(best_v, max_ip), c_reset
+        }
+      }
+
+      uniq_u = 0
+      for (k in fail_user) uniq_u++
+      printf "\n%s[被尝试用户名 Top 10]%s\n", c_cyan, c_reset
+      if (uniq_u == 0) {
+        printf "  %s（无异常记录）%s\n", c_green, c_reset
+      } else {
+        for (rank = 1; rank <= 10; rank++) {
+          best_k = ""; best_v = 0
+          for (k in fail_user) {
+            if (!(k in used_u) && fail_user[k] > best_v) {
+              best_v = fail_user[k]; best_k = k
+            }
+          }
+          if (best_k == "") break
+          used_u[best_k] = 1
+          printf "  %2d. %-20s %6d 次\n", rank, best_k, best_v
+        }
+      }
+    }
+  '
+}
+
+# ==============================================================================
+# 模块 14：SSH 安全配置（改端口 / 改密码 / 密钥登录 / 防锁死保护）
+# ==============================================================================
+mod_ssh_config() {
+  require_root || return 1
+  require_cmds sshd || return 1
+
+  local SSHD_MAIN="/etc/ssh/sshd_config"
+  local SSHD_DROP_DIR="/etc/ssh/sshd_config.d"
+  local SSHD_DROP_FILE="${SSHD_DROP_DIR}/01-ops-ssh.conf"
+  local SOCKET_DROP_DIR="/etc/systemd/system/ssh.socket.d"
+  local SOCKET_DROP_FILE="${SOCKET_DROP_DIR}/override.conf"
+  local BACKUP_ROOT="/var/backups/ops-ssh"
+
+  detect_ssh_service() {
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+      if systemctl list-unit-files ssh.service --no-legend 2>/dev/null | grep -q '^ssh\.service'; then
+        echo "ssh"
+        return 0
+      elif systemctl list-unit-files sshd.service --no-legend 2>/dev/null | grep -q '^sshd\.service'; then
+        echo "sshd"
+        return 0
+      fi
+    fi
+    if [[ -x /etc/init.d/ssh ]]; then
+      echo "ssh"
+    else
+      echo "sshd"
+    fi
+  }
+
+  ssh_socket_active() {
+    command -v systemctl >/dev/null 2>&1 \
+      && [[ -d /run/systemd/system ]] \
+      && (systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null)
+  }
+
+  get_user_home() {
+    local u="$1"
+    if command -v getent >/dev/null 2>&1; then
+      getent passwd "$u" | cut -d: -f6
+    else
+      awk -F: -v user="$u" '$1==user{print $6; exit}' /etc/passwd
+    fi
+  }
+
+  count_valid_keys() {
+    local ak_file="$1" cnt=0 line
+    [[ -f "$ak_file" ]] || { echo 0; return; }
+    while IFS= read -r line; do
+      is_valid_ssh_pubkey "$line" && cnt=$((cnt + 1))
+    done < "$ak_file"
+    echo "$cnt"
+  }
+
+  ssh_backup() {
+    local bk="${BACKUP_ROOT}/ssh-$(date +%Y%m%d-%H%M%S)-$$"
+    install -d -m 0700 "$bk"
+    [[ ! -f "$SSHD_MAIN" ]] || cp -a "$SSHD_MAIN" "${bk}/sshd_config"
+    [[ ! -f "$SSHD_DROP_FILE" ]] || cp -a "$SSHD_DROP_FILE" "${bk}/01-ops-ssh.conf"
+    [[ ! -f "$SOCKET_DROP_FILE" ]] || cp -a "$SOCKET_DROP_FILE" "${bk}/ssh.socket.override.conf"
+    echo "$bk"
+  }
+
+  ssh_restore() {
+    local bk="$1" svc
+    svc="$(detect_ssh_service)"
+    [[ -f "${bk}/sshd_config" ]] && cp -a "${bk}/sshd_config" "$SSHD_MAIN"
+    if [[ -f "${bk}/01-ops-ssh.conf" ]]; then
+      mkdir -p "$SSHD_DROP_DIR"
+      cp -a "${bk}/01-ops-ssh.conf" "$SSHD_DROP_FILE"
+    else
+      rm -f "$SSHD_DROP_FILE"
+    fi
+    if [[ -f "${bk}/ssh.socket.override.conf" ]]; then
+      mkdir -p "$SOCKET_DROP_DIR"
+      cp -a "${bk}/ssh.socket.override.conf" "$SOCKET_DROP_FILE"
+    else
+      rm -f "$SOCKET_DROP_FILE"
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+      systemctl daemon-reload
+      if ssh_socket_active; then
+        systemctl restart ssh.socket || true
+      fi
+      systemctl reload-or-restart "$svc" || true
+    elif command -v service >/dev/null 2>&1; then
+      service "$svc" restart || true
+    fi
+  }
+
+  ensure_dropin_included() {
+    mkdir -p "$SSHD_DROP_DIR"
+    # 确保 sshd_config 顶部包含 Include /etc/ssh/sshd_config.d/*.conf（OpenSSH 首个匹配生效）
+    if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_MAIN" 2>/dev/null; then
+      local tmp_main
+      tmp_main="$(mktemp)"
+      printf 'Include /etc/ssh/sshd_config.d/*.conf\n\n' > "$tmp_main"
+      cat "$SSHD_MAIN" >> "$tmp_main"
+      cat "$tmp_main" > "$SSHD_MAIN"
+      rm -f "$tmp_main"
+    fi
+  }
+
+  validate_and_reload_ssh() {
+    local bk="$1" new_port="${2:-}" svc
+    svc="$(detect_ssh_service)"
+
+    if ! sshd -t; then
+      err "sshd -t 配置校验失败！正在自动回滚到备份：${bk}"
+      ssh_restore "$bk"
+      return 1
+    fi
+
+    if [[ -n "$new_port" ]] && ssh_socket_active; then
+      step "检测到 systemd ssh.socket 激活模式（如 Ubuntu 22.10+/24.04），同步写入 socket 监听端口 ${new_port}..."
+      mkdir -p "$SOCKET_DROP_DIR"
+      cat > "$SOCKET_DROP_FILE" <<EOF
+[Socket]
+ListenStream=
+ListenStream=${new_port}
+EOF
+      systemctl daemon-reload
+      if ! systemctl restart ssh.socket; then
+        err "重启 ssh.socket 失败，正在自动回滚..."
+        ssh_restore "$bk"
+        return 1
+      fi
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+      if ! systemctl reload-or-restart "$svc"; then
+        err "重载 ${svc} 失败，正在自动回滚..."
+        ssh_restore "$bk"
+        return 1
+      fi
+    elif command -v service >/dev/null 2>&1; then
+      service "$svc" restart || { err "重启 ${svc} 失败，正在回滚..."; ssh_restore "$bk"; return 1; }
+    elif command -v rc-service >/dev/null 2>&1; then
+      rc-service "$svc" restart || { err "重启 ${svc} 失败，正在回滚..."; ssh_restore "$bk"; return 1; }
+    fi
+    ok "SSH 配置校验通过并已重载服务（备份：${bk}）"
+  }
+
+  show_ssh_summary() {
+    local eff ports pass_auth pub_auth root_login
+    eff="$(sshd -T 2>/dev/null || true)"
+    ports="$(awk '/^port /{p = p (p ? "," : "") $2} END{print (p ? p : "-")}' <<< "$eff")"
+    pass_auth="$(awk '/^passwordauthentication /{print $2; exit}' <<< "$eff")"
+    pub_auth="$(awk '/^pubkeyauthentication /{print $2; exit}' <<< "$eff")"
+    root_login="$(awk '/^permitrootlogin /{print $2; exit}' <<< "$eff")"
+    local sock_note=""
+    ssh_socket_active && sock_note=" | socket激活:是"
+    printf '%s当前生效 SSH：端口 %s | 密码登录 %s | 密钥登录 %s | Root登录 %s%s%s\n' \
+      "$C_DIM" "${ports:--}" "${pass_auth:--}" "${pub_auth:--}" "${root_login:--}" "$sock_note" "$C_RESET"
+  }
+
+  printf '\n%s=== SSH 安全配置 ===%s\n' "$C_BOLD" "$C_RESET"
+  show_ssh_summary
+  printf '\n'
+  echo "1) 修改 SSH 端口（兼容 Ubuntu ssh.socket + 防火墙/SELinux 处理）"
+  echo "2) 修改用户密码（passwd）"
+  echo "3) 配置 SSH 公钥登录与认证策略（添加公钥 / 开关密码与 Root 登录）"
+  echo "4) 查看当前生效 SSH 关键配置与监听端口"
+  echo "5) 从备份目录恢复 SSH 配置"
+  echo "0) 返回"
+
+  local op
+  read_prompt op "请选择操作" "1" || return 1
+
+  case "$op" in
+    1)
+      local new_port
+      read_prompt new_port "请输入新的 SSH 端口（建议 10000-65535）" "" || return 1
+      if [[ ! "$new_port" =~ ^[0-9]{1,5}$ ]] || (( 10#$new_port < 1 || 10#$new_port > 65535 )); then
+        err "端口不合法（必须是 1-65535 整数）。"
+        return 1
+      fi
+      new_port=$((10#$new_port))
+
+      if command -v ss >/dev/null 2>&1 && ss -H -lntp 2>/dev/null | grep -Ev 'sshd|systemd' | awk '{print $4}' | grep -Eq ":${new_port}$"; then
+        err "端口 ${new_port} 已被其他非 SSH 进程占用！"
+        return 1
+      fi
+
+      confirm_yn "确认将 SSH 端口修改为 ${new_port}？" N || { msg "已取消"; return 0; }
+
+      # SELinux 端口上下文放行
+      if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null || true)" == "Enforcing" ]]; then
+        if command -v semanage >/dev/null 2>&1; then
+          step "SELinux Enforcing 模式：放行端口 ${new_port} 到 ssh_port_t..."
+          semanage port -a -t ssh_port_t -p tcp "$new_port" 2>/dev/null \
+            || semanage port -m -t ssh_port_t -p tcp "$new_port" 2>/dev/null \
+            || warn "semanage 放行失败，请手动检查 SELinux 端口策略"
+        else
+          warn "检测到 SELinux Enforcing 且未安装 semanage，新端口可能被拦截！"
+        fi
+      fi
+
+      # 防火墙提前放行新端口
+      if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+        if confirm_yn "检测到 UFW 防火墙已开启，是否立即放行 ${new_port}/tcp？" Y; then
+          ufw allow "${new_port}/tcp" || warn "ufw allow 失败"
+        fi
+      elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        if confirm_yn "检测到 firewalld 已开启，是否立即放行 ${new_port}/tcp？" Y; then
+          firewall-cmd --permanent --add-port="${new_port}/tcp" && firewall-cmd --reload || warn "firewall-cmd 放行失败"
+        fi
+      fi
+
+      local bk
+      bk="$(ssh_backup)"
+      ensure_dropin_included
+      upsert_sshd_option "$SSHD_DROP_FILE" "Port" "$new_port"
+      chmod 600 "$SSHD_DROP_FILE"
+
+      validate_and_reload_ssh "$bk" "$new_port" || return 1
+      printf '\n'
+      warn "请勿关闭当前 SSH 窗口！请立即新开终端测试：ssh -p ${new_port} <user>@<VPS_IP>"
+      warn "确认新端口能正常登录后，再退出当前会话（云厂商安全组也需放行 TCP ${new_port}）。"
+      ;;
+
+    2)
+      local def_user="${SUDO_USER:-root}" target_user
+      read_prompt target_user "请输入要修改密码的用户名" "$def_user" || return 1
+      if ! id -u "$target_user" >/dev/null 2>&1; then
+        err "用户不存在：${target_user}"
+        return 1
+      fi
+      msg "即将为用户 ${target_user} 设置新密码（由系统 passwd 交互完成）："
+      if [[ -r /dev/tty ]]; then
+        passwd "$target_user" </dev/tty
+      else
+        passwd "$target_user"
+      fi
+      ;;
+
+    3)
+      local def_user="${SUDO_USER:-root}" target_user target_home ssh_dir ak_file
+      read_prompt target_user "要配置公钥的目标用户名" "$def_user" || return 1
+      if ! id -u "$target_user" >/dev/null 2>&1; then
+        err "用户不存在：${target_user}"
+        return 1
+      fi
+      target_home="$(get_user_home "$target_user")"
+      [[ -n "$target_home" && -d "$target_home" ]] || { err "找不到用户主目录：${target_user}"; return 1; }
+      ssh_dir="${target_home}/.ssh"
+      ak_file="${ssh_dir}/authorized_keys"
+
+      local key_cnt
+      key_cnt="$(count_valid_keys "$ak_file")"
+      echo "用户 ${target_user} 当前有效公钥数：${key_cnt} (${ak_file})"
+      echo "1) 粘贴添加 SSH 公钥"
+      echo "2) 从 GitHub 拉取公钥 (https://github.com/<username>.keys)"
+      echo "3) 查看/删除已有公钥"
+      echo "4) 配置认证策略（启用密钥 / 开关密码登录 / 设置 PermitRootLogin）"
+      echo "0) 返回"
+      local kop
+      read_prompt kop "请选择操作" "1" || return 1
+
+      append_key_dedup() {
+        local pubkey="$1"
+        if ! is_valid_ssh_pubkey "$pubkey"; then
+          warn "跳过非法公钥格式：${pubkey:0:40}..."
+          return 1
+        fi
+        mkdir -p "$ssh_dir"
+        chmod 700 "$ssh_dir"
+        touch "$ak_file"
+        chmod 600 "$ak_file"
+        if grep -Fqx "$pubkey" "$ak_file"; then
+          msg "公钥已存在，跳过重复写入。"
+        else
+          printf '%s\n' "$pubkey" >> "$ak_file"
+          ok "已添加公钥：${pubkey:0:48}..."
+        fi
+        chown -R "${target_user}:$(id -gn "$target_user")" "$ssh_dir"
+      }
+
+      case "$kop" in
+        1)
+          local pubkey
+          read_prompt pubkey "请粘贴完整 SSH 公钥（如 ssh-ed25519 AAAA...）" "" || return 1
+          append_key_dedup "$pubkey" || return 1
+          ;;
+        2)
+          require_cmds curl || return 1
+          local gh_user gh_keys line added=0
+          read_prompt gh_user "请输入 GitHub 用户名（如 realLeoKnox）" "" || return 1
+          [[ "$gh_user" =~ ^[A-Za-z0-9-]+$ ]] || { err "GitHub 用户名不合法"; return 1; }
+          step "拉取 https://github.com/${gh_user}.keys ..."
+          gh_keys="$(curl -fsSL --connect-timeout 15 --max-time 20 "https://github.com/${gh_user}.keys" || true)"
+          if [[ -z "$gh_keys" ]]; then
+            err "未获取到任何公钥（用户不存在或未配置公开 SSH Key）。"
+            return 1
+          fi
+          echo "获取到以下公钥："
+          printf '%s\n' "$gh_keys" | awk '{printf "  %d) %s %s...\n", NR, $1, substr($2, 1, 24)}'
+          confirm_yn "确认将这些公钥写入 ${ak_file}？" Y || { msg "已取消"; return 0; }
+          while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            if append_key_dedup "$line"; then
+              added=$((added + 1))
+            fi
+          done <<< "$gh_keys"
+          ok "共处理 ${added} 条公钥。"
+          ;;
+        3)
+          if [[ ! -s "$ak_file" ]]; then
+            warn "${ak_file} 为空或不存在。"
+            return 0
+          fi
+          awk '{printf "  %2d) %s %s... %s\n", NR, $1, substr($2,1,20), ($3 ? $3 : "")}' "$ak_file"
+          local del_ln
+          read_prompt del_ln "输入要删除的行号（留空返回）" "" || return 1
+          if [[ -n "$del_ln" ]]; then
+            if [[ ! "$del_ln" =~ ^[0-9]+$ ]]; then
+              err "行号必须是数字"
+              return 1
+            fi
+            confirm_yn "确认删除第 ${del_ln} 行公钥？" N || { msg "已取消"; return 0; }
+            local tmp_ak
+            tmp_ak="$(mktemp)"
+            awk -v n="$del_ln" 'NR != n' "$ak_file" > "$tmp_ak"
+            cat "$tmp_ak" > "$ak_file"
+            rm -f "$tmp_ak"
+            chmod 600 "$ak_file"
+            chown "${target_user}:$(id -gn "$target_user")" "$ak_file"
+            ok "已删除第 ${del_ln} 行。"
+          fi
+          return 0
+          ;;
+        4) ;;
+        0) return 0 ;;
+        *) err "无效选择"; return 1 ;;
+      esac
+
+      # 若刚添加完公钥，询问是否继续调整认证策略；若选 4 直接进入策略设置
+      if [[ "$kop" == "1" || "$kop" == "2" ]]; then
+        confirm_yn "是否继续调整 SSH 认证策略（如关闭密码登录 / 限制 Root 仅密钥登录）？" Y || return 0
+      fi
+
+      key_cnt="$(count_valid_keys "$ak_file")"
+      local root_key_cnt
+      root_key_cnt="$(count_valid_keys /root/.ssh/authorized_keys)"
+
+      local disable_pass="N" root_mode=""
+      if (( key_cnt == 0 && root_key_cnt == 0 )); then
+        warn "检测到 ${target_user} 与 root 均无有效公钥，为防止锁死，本次禁止关闭密码登录！"
+      else
+        if confirm_yn "是否禁用 SSH 密码登录（仅允许密钥登录，推荐）？" N; then
+          disable_pass="Y"
+        fi
+      fi
+
+      echo
+      echo "设置 PermitRootLogin："
+      echo "  1) prohibit-password（仅允许密钥登录 root，推荐）"
+      echo "  2) yes（允许 root 密码/密钥登录）"
+      echo "  3) no（完全禁止 root SSH 登录）"
+      echo "  4) 保持现状不修改"
+      local rchoice
+      read_prompt rchoice "选择 [1-4]" "1" || return 1
+      case "$rchoice" in
+        1) root_mode="prohibit-password" ;;
+        2) root_mode="yes" ;;
+        3)
+          if [[ "$target_user" == "root" ]]; then
+            warn "当前目标用户是 root，禁止 root 登录前请确保已有其他具备 sudo 权限的普通用户！"
+            confirm_yn "仍确认设置 PermitRootLogin no？" N || { msg "已取消"; return 0; }
+          fi
+          root_mode="no"
+          ;;
+        4) root_mode="" ;;
+        *) err "无效选择"; return 1 ;;
+      esac
+
+      local bk
+      bk="$(ssh_backup)"
+      ensure_dropin_included
+      upsert_sshd_option "$SSHD_DROP_FILE" "PubkeyAuthentication" "yes"
+      if [[ "$disable_pass" == "Y" ]]; then
+        upsert_sshd_option "$SSHD_DROP_FILE" "PasswordAuthentication" "no"
+        if sshd -T 2>/dev/null | grep -q '^kbdinteractiveauthentication '; then
+          upsert_sshd_option "$SSHD_DROP_FILE" "KbdInteractiveAuthentication" "no"
+        else
+          upsert_sshd_option "$SSHD_DROP_FILE" "ChallengeResponseAuthentication" "no"
+        fi
+      else
+        if confirm_yn "是否显式开启密码登录（PasswordAuthentication yes）？选 N 保持现状" N; then
+          upsert_sshd_option "$SSHD_DROP_FILE" "PasswordAuthentication" "yes"
+        fi
+      fi
+      if [[ -n "$root_mode" ]]; then
+        upsert_sshd_option "$SSHD_DROP_FILE" "PermitRootLogin" "$root_mode"
+      fi
+      chmod 600 "$SSHD_DROP_FILE"
+
+      validate_and_reload_ssh "$bk" || return 1
+      show_ssh_summary
+      warn "请勿关闭当前 SSH 会话！请新开终端测试公钥登录成功后再退出。"
+      ;;
+
+    4)
+      printf '\n%s[sshd -T 关键生效配置]%s\n' "$C_CYAN" "$C_RESET"
+      sshd -T 2>/dev/null | grep -E '^(port|listenaddress|permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|maxauthtries|allowusers|allowgroups) ' || true
+      printf '\n%s[SSH 监听端口]%s\n' "$C_CYAN" "$C_RESET"
+      ss -H -lntp 2>/dev/null | grep -E 'sshd|systemd' || true
+      if [[ -f "$SSHD_DROP_FILE" ]]; then
+        printf '\n%s[%s]%s\n' "$C_CYAN" "$SSHD_DROP_FILE" "$C_RESET"
+        cat "$SSHD_DROP_FILE"
+      fi
+      ;;
+
+    5)
+      msg "可用 SSH 备份："
+      find "$BACKUP_ROOT" -maxdepth 1 -type d -name 'ssh-*' -print 2>/dev/null | sort || true
+      local target_bk
+      read_prompt target_bk "请输入完整备份目录绝对路径" "" || return 1
+      [[ "$target_bk" == "${BACKUP_ROOT}/ssh-"* && -d "$target_bk" && -f "${target_bk}/sshd_config" ]] \
+        || { err "备份路径不合法"; return 1; }
+      confirm_yn "确认恢复该备份并重载 SSH 服务？" N || { msg "已取消"; return 0; }
+      ssh_restore "$target_bk"
+      ok "已从备份恢复 SSH 配置。"
+      show_ssh_summary
+      ;;
+
+    0) msg "返回主菜单" ;;
+    *) err "无效选择"; return 1 ;;
+  esac
+}
+
+# ==============================================================================
+# 模块 15：查询 SSH 日志（美化输出 + 爆破统计 + 实时跟踪）
+# ==============================================================================
+mod_ssh_logs() {
+  printf '\n%s=== SSH 日志审计与美化查询 ===%s\n' "$C_BOLD" "$C_RESET"
+
+  local LOG_SOURCE="" LOG_FILE="" JOURNAL_ARGS=()
+
+  detect_ssh_log_source() {
+    if command -v journalctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+      if journalctl -u ssh -u sshd -n 1 --no-pager >/dev/null 2>&1 \
+        && [[ -n "$(journalctl -u ssh -u sshd -n 1 --no-pager --output=short-iso 2>/dev/null | grep -v '^-- ' || true)" ]]; then
+        LOG_SOURCE="journald"
+        JOURNAL_ARGS=(-u ssh -u sshd --no-pager --output=short-iso)
+        return 0
+      elif journalctl _COMM=sshd -n 1 --no-pager >/dev/null 2>&1 \
+        && [[ -n "$(journalctl _COMM=sshd -n 1 --no-pager --output=short-iso 2>/dev/null | grep -v '^-- ' || true)" ]]; then
+        LOG_SOURCE="journald"
+        JOURNAL_ARGS=(_COMM=sshd --no-pager --output=short-iso)
+        return 0
+      fi
+    fi
+    if [[ -r /var/log/auth.log ]]; then
+      LOG_SOURCE="file"
+      LOG_FILE="/var/log/auth.log"
+      return 0
+    elif [[ -r /var/log/secure ]]; then
+      LOG_SOURCE="file"
+      LOG_FILE="/var/log/secure"
+      return 0
+    fi
+    return 1
+  }
+
+  if ! detect_ssh_log_source; then
+    err "无法读取 SSH 日志（需要 root/adm 权限，或系统尚未产生 sshd/auth.log/secure 日志）。"
+    return 1
+  fi
+
+  stream_ssh_logs() {
+    local since_opt="${1:-}"
+    if [[ "$LOG_SOURCE" == "journald" ]]; then
+      if [[ -n "$since_opt" ]]; then
+        journalctl "${JOURNAL_ARGS[@]}" --since "$since_opt" 2>/dev/null || true
+      else
+        journalctl "${JOURNAL_ARGS[@]}" -n 5000 2>/dev/null || true
+      fi
+    else
+      grep -E 'sshd(\[[0-9]+\])?:' "$LOG_FILE" 2>/dev/null || true
+    fi
+  }
+
+  if [[ "$LOG_SOURCE" == "journald" ]]; then
+    echo "数据源：systemd journal (${JOURNAL_ARGS[0]} ${JOURNAL_ARGS[1]})"
+  else
+    echo "数据源：${LOG_FILE}"
+  fi
+  printf '\n'
+  echo "1) 综合安全概览（统计卡片 + 最近成功登录 + 异常 IP/用户名 Top 10 + 在线会话）"
+  echo "2) 查看最近成功登录记录"
+  echo "3) 查看最近失败 / 爆破尝试记录"
+  echo "4) 按指定 IP 或用户名筛选"
+  echo "5) 实时跟踪 SSH 日志（彩色高亮，Ctrl+C 返回）"
+  echo "0) 返回"
+
+  local op
+  read_prompt op "请选择查询方式" "1" || return 1
+
+  case "$op" in
+    1)
+      local since=""
+      if [[ "$LOG_SOURCE" == "journald" ]]; then
+        echo "时间范围：1) 最近 24 小时  2) 最近 7 天  3) 最近 30 天  4) 全部(最多 5000 行)"
+        local rng
+        read_prompt rng "选择 [1-4]" "2" || return 1
+        case "$rng" in
+          1) since="24 hours ago" ;;
+          2) since="7 days ago" ;;
+          3) since="30 days ago" ;;
+          4) since="" ;;
+          *) err "无效选择"; return 1 ;;
+        esac
+      fi
+      printf '\n'
+      stream_ssh_logs "$since" | render_ssh_log_report summary
+      printf '\n%s[当前在线会话 (who)]%s\n' "$C_CYAN" "$C_RESET"
+      who 2>/dev/null || echo "（无）"
+      ;;
+
+    2)
+      local n
+      read_prompt n "显示最近多少条成功记录" "30" || return 1
+      [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) || { err "请输入正整数"; return 1; }
+      printf '\n'
+      stream_ssh_logs "" | render_ssh_log_report accepted "" "$n"
+      ;;
+
+    3)
+      local n
+      read_prompt n "显示最近多少条失败/非法尝试记录" "40" || return 1
+      [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) || { err "请输入正整数"; return 1; }
+      printf '\n'
+      stream_ssh_logs "" | render_ssh_log_report failed "" "$n"
+      ;;
+
+    4)
+      local kw n
+      read_prompt kw "请输入要筛选的 IP 或用户名关键字" "" || return 1
+      [[ -n "$kw" ]] || { err "关键字不能为空"; return 1; }
+      read_prompt n "最多显示多少条" "50" || return 1
+      [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) || { err "请输入正整数"; return 1; }
+      printf '\n'
+      stream_ssh_logs "" | render_ssh_log_report filter "$kw" "$n"
+      ;;
+
+    5)
+      msg "开始实时跟踪 SSH 日志（按 Ctrl+C 返回）..."
+      local follow_rc=0
+      (
+        trap 'exit 0' INT
+        if [[ "$LOG_SOURCE" == "journald" ]]; then
+          journalctl "${JOURNAL_ARGS[@]}" -n 20 -f
+        else
+          tail -n 20 -F "$LOG_FILE" | grep --line-buffered -E 'sshd(\[[0-9]+\])?:'
+        fi
+      ) | awk -v g="$C_GREEN" -v r="$C_RED" -v y="$C_YELLOW" -v n="$C_RESET" '
+        /Accepted /        { print g $0 n; fflush(); next }
+        /Failed /          { print r $0 n; fflush(); next }
+        /Invalid user /    { print y $0 n; fflush(); next }
+        { print; fflush() }
+      ' || follow_rc=$?
+      return 0
+      ;;
+
+    0) msg "返回主菜单" ;;
+    *) err "无效选择"; return 1 ;;
+  esac
+}
+
 # ==============================================================================
 # 主菜单与 CLI 调度
 # ==============================================================================
@@ -2370,10 +3221,11 @@ print_banner() {
     "$C_DIM" "$os_name" "$arch" "$cc" "${disk_info:--}" "${swap_info:--}" "$C_RESET"
   printf '%s=====================================================%s\n' "$C_BLUE" "$C_RESET"
   cat <<'MENU'
-  [系统基础]
+  [系统基础与安全]
    1) 修改主机名               2) 瘦身拳（系统/日志/Docker 清理）
    3) 开启 TCP BBR             4) Swap 交互式管理（增/改/删）
    7) LinuxMirrors 一键换源   12) 系统信息与状态速查
+  14) SSH 安全配置（端口/密码/密钥） 15) 查询 SSH 日志（美化输出）
 
   [网络与代理]
    5) SpeedTest 测速（可即用即删） 6) 快速 GOST 代理管理 (SOCKS5/HTTP)
@@ -2415,6 +3267,8 @@ VPS 运维工具箱 v${OPS_VERSION}
   nodequality   NodeQuality 测试
   status        系统信息与状态速查
   install-self  安装/更新脚本到 /usr/local/bin/ops（别名: update）
+  ssh           SSH 安全配置（改端口/改密码/密钥登录/防锁死）
+  sshlog        查询 SSH 登录日志（美化输出/统计/实时跟踪）
   -h, --help    显示本帮助
   -v, --version 显示版本号
 EOF
@@ -2435,6 +3289,8 @@ dispatch_subcommand() {
     11|nodequality) run_module_isolated mod_nodequality ;;
     12|status)     run_module_isolated mod_status ;;
     13|install-self|update) run_module_isolated mod_install_self ;;
+    14|ssh|ssh-config) run_module_isolated mod_ssh_config ;;
+    15|sshlog|ssh-logs) run_module_isolated mod_ssh_logs ;;
     -h|--help|help) usage ;;
     -v|--version)  echo "ops.sh v${OPS_VERSION}" ;;
     *)
@@ -2455,7 +3311,7 @@ interactive_loop() {
         msg "已退出运维工具箱。"
         break
         ;;
-      1|2|3|4|5|6|7|8|9|10|11|12|13)
+      1|2|3|4|5|6|7|8|9|10|11|12|13|14|15)
         dispatch_subcommand "$choice"
         rc=$?
         if (( rc != 0 )); then

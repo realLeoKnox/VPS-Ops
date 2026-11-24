@@ -119,10 +119,10 @@ assert_fail "sync_hosts removes old hostname"       grep -q "old-vps" "$HOSTS_TM
 echo
 echo "=== 3. CLI 调度、管道与 SpeedTest 临时模式检查 ==="
 ver_out="$(bash "$OPS_SH" --version)"
-assert_eq "CLI --version" "ops.sh v1.1.0" "$ver_out"
+assert_eq "CLI --version" "ops.sh v1.2.0" "$ver_out"
 
 pipe_ver="$(cat "$OPS_SH" | bash -s -- --version)"
-assert_eq "Piped bash -s -- --version" "ops.sh v1.1.0" "$pipe_ver"
+assert_eq "Piped bash -s -- --version" "ops.sh v1.2.0" "$pipe_ver"
 
 help_out="$(bash "$OPS_SH" --help)"
 assert_ok "CLI --help contains swap" grep -q "swap" <<< "$help_out"
@@ -213,11 +213,56 @@ assert_fail "proxy cleanup deletes env file" test -e "$ENV_FILE"
 assert_ok   "proxy cleanup keeps original user config" grep -q "export FOO=bar" "${FAKE_HOME}/.bashrc"
 
 echo
-echo "=== 5. 非 root 拦截与 errexit 隔离检查 ==="
+echo "=== 5. SSH 安全配置辅助函数与日志美化解析测试 ==="
+assert_ok   "valid ed25519 pubkey" is_valid_ssh_pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKeyDataForTestingOnly1234567890 user@host"
+assert_ok   "valid rsa pubkey"     is_valid_ssh_pubkey "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDMockKeyDataForTestingOnly1234567890"
+assert_fail "invalid pubkey text"  is_valid_ssh_pubkey "not-a-valid-ssh-key"
+
+SSHD_TEST_CONF="${TMP_DIR}/01-ops-ssh.conf"
+upsert_sshd_option "$SSHD_TEST_CONF" "Port" "22222"
+upsert_sshd_option "$SSHD_TEST_CONF" "PasswordAuthentication" "no"
+upsert_sshd_option "$SSHD_TEST_CONF" "Port" "23456"
+port_cnt="$(grep -c '^Port ' "$SSHD_TEST_CONF")"
+assert_eq "upsert_sshd_option deduplicates Port" "1" "$port_cnt"
+assert_ok "upsert_sshd_option updates Port to 23456" grep -qx "Port 23456" "$SSHD_TEST_CONF"
+assert_ok "upsert_sshd_option preserves PasswordAuthentication" grep -qx "PasswordAuthentication no" "$SSHD_TEST_CONF"
+
+# 构造混合 ISO (journalctl) 与 syslog (auth.log) 格式的 SSH 日志测试美化输出
+SAMPLE_SSH_LOG="${TMP_DIR}/ssh.log"
+cat > "$SAMPLE_SSH_LOG" <<'LOGEOF'
+2026-11-24T09:10:01+0800 vps sshd[101]: Accepted publickey for root from 203.0.113.10 port 51234 ssh2
+2026-11-24T09:11:02+0800 vps sshd[102]: Failed password for root from 198.51.100.77 port 44111 ssh2
+2026-11-24T09:11:05+0800 vps sshd[103]: Failed password for invalid user admin from 198.51.100.77 port 44112 ssh2
+Nov 24 09:12:09 vps sshd[104]: Invalid user testuser from 198.51.100.88 port 50001
+Nov 24 09:15:30 vps sshd[105]: Accepted password for leo from 203.0.113.20 port 60001 ssh2
+LOGEOF
+
+ssh_summary="$(render_ssh_log_report summary < "$SAMPLE_SSH_LOG")"
+assert_ok "ssh log summary shows 2 accepted" grep -q "成功登录: .*2" <<< "$ssh_summary"
+assert_ok "ssh log summary shows 1 fail"     grep -q "认证失败: .*1" <<< "$ssh_summary"
+assert_ok "ssh log summary shows 2 invalid"  grep -q "非法用户: .*2" <<< "$ssh_summary"
+assert_ok "ssh log summary ranks top IP 198.51.100.77" grep -q "1. 198.51.100.77" <<< "$ssh_summary"
+
+ssh_accepted="$(render_ssh_log_report accepted "" 10 < "$SAMPLE_SSH_LOG")"
+assert_ok   "ssh log accepted includes root" grep -q "203.0.113.10" <<< "$ssh_accepted"
+assert_fail "ssh log accepted excludes failed IP" grep -q "198.51.100.77" <<< "$ssh_accepted"
+
+ssh_failed="$(render_ssh_log_report failed "" 10 < "$SAMPLE_SSH_LOG")"
+assert_ok   "ssh log failed includes attacker IP" grep -q "198.51.100.77" <<< "$ssh_failed"
+assert_fail "ssh log failed excludes accepted IP" grep -q "203.0.113.10" <<< "$ssh_failed"
+
+ssh_filter="$(render_ssh_log_report filter "leo" 10 < "$SAMPLE_SSH_LOG")"
+assert_ok   "ssh log filter matches user leo" grep -q "203.0.113.20" <<< "$ssh_filter"
+assert_fail "ssh log filter excludes non-matching root" grep -q "203.0.113.10" <<< "$ssh_filter"
+
+echo
+echo "=== 6. 非 root 拦截与 errexit 隔离检查 ==="
 if [[ "$(id -u)" -ne 0 ]]; then
   bbr_out="$(OPS_USE_STDIN=1 bash "$OPS_SH" bbr 2>&1 || true)"
   assert_ok   "non-root bbr shows root error" grep -q "需要 root 权限" <<< "$bbr_out"
   assert_fail "non-root bbr stops before body" grep -q "开启 TCP BBR" <<< "$bbr_out"
+  ssh_out="$(OPS_USE_STDIN=1 bash "$OPS_SH" ssh 2>&1 || true)"
+  assert_ok   "non-root ssh shows root error" grep -q "需要 root 权限" <<< "$ssh_out"
 fi
 
 echo
